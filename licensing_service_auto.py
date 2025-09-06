@@ -5,6 +5,7 @@ Licensing Service v11 — Users + Login (one-time code) + Auto-Renew
 FastAPI + Ed25519 + PBKDF2
 
 Endpoints:
+- GET  /                -> ping
 - GET  /public-key
 - GET  /healthz
 - POST /admin/users/create     (admin) -> cria usuário
@@ -18,26 +19,26 @@ Endpoints:
 - GET  /tokens                 (admin)  -> auditoria
 - POST /issue                  (admin)  -> emite JSON de licença manual (debug)
 """
-import os, json, base64, hashlib, secrets
+import os, json, base64, hashlib, secrets, re
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional, Literal, Tuple
 
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, field_validator, model_validator, Field, ConfigDict
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
 
 # --------- Paths e configuração ---------
-APP_DIR = Path(os.getenv("APP_DIR", "."))
+APP_DIR = Path(os.getenv("APP_DIR", "."))  # no Render, defina: APP_DIR=/var/data/licensing
 KEYS_DIR = APP_DIR / "keys"
 DATA_DIR = APP_DIR / "data"
 KEYS_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 PRIV = KEYS_DIR / "ed25519_private.pem"
-PUB = KEYS_DIR / "ed25519_public.pem"
+PUB  = KEYS_DIR / "ed25519_public.pem"
 DB_PATH = DATA_DIR / "db.json"
 
 # Defina no Render (Settings -> Environment):
@@ -52,13 +53,18 @@ LETTER_VALUES_DEFAULT = {
 }
 b64u = lambda b: base64.urlsafe_b64encode(b).decode().rstrip("=")
 
+def _safe_name(s: str) -> str:
+    """Converte string para nome de arquivo seguro (remove/ troca caracteres inválidos)."""
+    s = (s or "").strip()
+    return re.sub(r'[^A-Za-z0-9_.-]+', '-', s)
+
 def load_or_create_keys():
     if PRIV.exists() and PUB.exists():
         priv = serialization.load_pem_private_key(PRIV.read_bytes(), password=None)
-        pub = serialization.load_pem_public_key(PUB.read_bytes())
+        pub  = serialization.load_pem_public_key(PUB.read_bytes())
         return priv, pub
     priv = Ed25519PrivateKey.generate()
-    pub = priv.public_key()
+    pub  = priv.public_key()
     PRIV.write_bytes(
         priv.private_bytes(
             serialization.Encoding.PEM,
@@ -140,7 +146,10 @@ def verify_password(pwd: str, rec: dict) -> bool:
 
 # --------- Schemas ---------
 class LicPayload(BaseModel):
-    schema: str = "v1"
+    # Evita warning do Pydantic usando alias "schema"
+    model_config = ConfigDict(populate_by_name=True)
+
+    schema_version: str = Field('v1', alias='schema')
     ym: str
     cnpj: str
     company_name: Optional[str]
@@ -216,6 +225,10 @@ class IssueReq(BaseModel):
 
 # --------- FastAPI ---------
 app = FastAPI(title="Licensing Service v11 (Users + Login + Auto-Renew)", version="1.0.0")
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "Licensing Service v11", "version": "1.0.0", "docs": "/docs"}
 
 @app.get("/public-key")
 def get_pk():
@@ -319,6 +332,7 @@ def claim_auth(req: ClaimAuthReq):
     user = db["users"].get(ac["username"])
     if not user or user.get("status") != "active":
         raise HTTPException(403, "user disabled")
+
     token = secrets.token_urlsafe(32)
     db["tokens"][token] = {
         "username": ac["username"],
@@ -374,12 +388,16 @@ async def renew(request: Request):
         issued_at=datetime.utcnow().isoformat() + "Z",
         expires_at=eom(ym),
         key_id=key_id(),
-    ).dict()
+    ).model_dump(by_alias=True)
 
     token_json = {"license": payload, "signature": sign(payload), "key_id": key_id()}
     out_dir = DATA_DIR / "licenses" / ym
     out_dir.mkdir(parents=True, exist_ok=True)
-    fname = f"{rec['cnpj']}_{rec['installation_id']}_{ym}.json"
+
+    cnpj_safe = _safe_name(rec["cnpj"])
+    inst_safe = _safe_name(rec["installation_id"])
+    fname = f"{cnpj_safe}_{inst_safe}_{ym}.json"
+
     (out_dir / fname).write_text(json.dumps(token_json, ensure_ascii=False, indent=2), encoding="utf-8")
     return JSONResponse(token_json)
 
@@ -426,16 +444,20 @@ def issue(req: IssueReq, x_api_key: str = Header(default="")):
         issued_at=datetime.utcnow().isoformat() + "Z",
         expires_at=req.expires_at or eom(req.ym),
         key_id=key_id(),
-    ).dict()
+    ).model_dump(by_alias=True)
+
     token = {"license": payload, "signature": sign(payload), "key_id": key_id()}
     out = DATA_DIR / "licenses" / req.ym
     out.mkdir(parents=True, exist_ok=True)
-    (out / f"{req.cnpj}_{req.installation_id}_{req.ym}.json").write_text(
+
+    cnpj_safe = _safe_name(req.cnpj)
+    inst_safe = _safe_name(req.installation_id)
+    (out / f"{cnpj_safe}_{inst_safe}_{req.ym}.json").write_text(
         json.dumps(token, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return token
 
 # ----- Main (dev local) -----
 if __name__ == "__main__":
-    import uvicorn, os
+    import uvicorn
     uvicorn.run("licensing_service_auto:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
