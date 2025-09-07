@@ -3,4 +3,4 @@ uvicorn[standard]==0.30.6
 cryptography==43.0.1
 pydantic==2.8.2
 SQLAlchemy==2.0.32
-psycopg2-binary==2.9.9
+psycopg2-binary==3.2.1
