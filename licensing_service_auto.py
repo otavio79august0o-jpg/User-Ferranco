@@ -2,17 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 Licensing Service v12 — PostgreSQL (Neon) + Users + Login + Auto-Renew
-FastAPI + SQLAlchemy (sync, psycopg2) + Ed25519 + PBKDF2
+FastAPI + SQLAlchemy (sync, psycopg) + Ed25519 + PBKDF2
 
 Endpoints (principais):
 - POST /admin/users/create (X-API-Key)
 - GET  /admin/users/list   (X-API-Key)
+- POST /admin/users/disable (X-API-Key)
+- POST /admin/users/reset-pass (X-API-Key)
+- POST /revoke (X-API-Key)
+- GET  /tokens (X-API-Key)
 - POST /login              -> auth_code
 - POST /claim-auth         -> refresh_token
 - POST /renew              (Bearer <refresh_token>) -> licença mensal
-- POST /revoke             (X-API-Key)
-- GET  /tokens             (X-API-Key)
-- GET  /public-key, /healthz
+- GET  /public-key, /healthz, /admin/debug/paths
 """
 import os, re, json, base64, hashlib, secrets
 from datetime import datetime, date, timedelta
@@ -36,13 +38,15 @@ from cryptography.hazmat.primitives import serialization
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "change-me")  # header X-API-Key
 
 def normalize_db_url(url: str) -> str:
-    """Troca 'postgresql://' por 'postgresql+psycopg2://' se precisar."""
+    """Força o uso do driver psycopg (psycopg 3) com SQLAlchemy."""
     if not url:
         return url
-    if url.startswith("postgresql+psycopg2://"):
+    if url.startswith("postgresql+psycopg://"):
         return url
+    if url.startswith("postgresql+psycopg2://"):
+        return "postgresql+psycopg://" + url[len("postgresql+psycopg2://"):]
     if url.startswith("postgresql://"):
-        return "postgresql+psycopg2://" + url[len("postgresql://"):]
+        return "postgresql+psycopg://" + url[len("postgresql://"):]
     return url
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -299,7 +303,7 @@ def _mask_url(url: str) -> str:
 @app.get("/admin/debug/paths")
 def debug_paths(x_api_key: str = Header(default="")):
     if x_api_key != ADMIN_API_KEY: raise HTTPException(401, "unauthorized")
-    return {"DATABASE_URL": _mask_url(DATABASE_URL), "driver": "psycopg2", "key_id": key_id()}
+    return {"DATABASE_URL": _mask_url(DATABASE_URL), "driver": "psycopg", "key_id": key_id()}
 
 # ---- Admin: Users ----
 @app.post("/admin/users/create")
@@ -458,23 +462,24 @@ def list_tokens(x_api_key: str = Header(default="")):
 @app.post("/issue")
 def issue(req: IssueReq, x_api_key: str = Header(default="")):
     if x_api_key != ADMIN_API_KEY: raise HTTPException(401, "unauthorized")
+    ym = req.ym or today_ym()
     rmin, rmax = acc_range(
-        req.installation_id, req.ym, req.range_mode,
+        req.installation_id, ym, req.range_mode,
         req.fixed_min or 0, req.fixed_max or 0, req.delta or 0
     )
     lv = req.letter_values or LETTER_VALUES_DEFAULT
     payload = LicPayload(
-        ym=req.ym or today_ym(), cnpj=req.cnpj, company_name=req.company_name,
+        ym=ym, cnpj=req.cnpj, company_name=req.company_name,
         installation_id=req.installation_id, range_mode=req.range_mode,
         accepted_range=(rmin, rmax), require_sum_code=req.require_sum_code,
         letter_values=lv, features=req.features,
         issued_at=datetime.utcnow().isoformat() + "Z",
-        expires_at=req.expires_at or eom(req.ym or today_ym()), key_id=key_id(),
+        expires_at=req.expires_at or eom(ym), key_id=key_id(),
     ).model_dump(by_alias=True)
     token_json = {"license": payload, "signature": sign(payload), "key_id": key_id()}
     with SessionLocal() as s:
         s.add(LicenseLog(
-            ym=payload["ym"], cnpj=req.cnpj, installation_id=req.installation_id,
+            ym=ym, cnpj=req.cnpj, installation_id=req.installation_id,
             payload=token_json["license"], signature=token_json["signature"]
         ))
         s.commit()
