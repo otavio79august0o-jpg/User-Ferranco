@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Licensing Service v12 — PostgreSQL (Neon) + Users + Login + Auto-Renew
-FastAPI + SQLAlchemy (sync, psycopg) + Ed25519 + PBKDF2
+Licensing Service v12.1 — PostgreSQL (Neon) + Users + Login + Auto-Renew
+FastAPI + SQLAlchemy (psycopg 3) + Ed25519 + PBKDF2
 
-Endpoints (principais):
-- POST /admin/users/create (X-API-Key)
-- GET  /admin/users/list   (X-API-Key)
-- POST /admin/users/disable (X-API-Key)
-- POST /admin/users/reset-pass (X-API-Key)
-- POST /revoke (X-API-Key)
-- GET  /tokens (X-API-Key)
-- POST /login              -> auth_code
-- POST /claim-auth         -> refresh_token
-- POST /renew              (Bearer <refresh_token>) -> licença mensal
-- GET  /public-key, /healthz, /admin/debug/paths
+Endpoints (admin):
+- POST /admin/users/create, /admin/users/disable, /admin/users/reset-pass
+- GET  /admin/users/list
+- GET  /admin/debug/paths
+- GET  /tokens
+- POST /revoke
+- POST /admin/tokens/delete            <-- NOVO (hard delete de tokens)
+- POST /admin/cleanup                  <-- NOVO (limpa revogados antigos, auth_codes vencidos, logs antigos)
+
+Endpoints (cliente):
+- POST /login -> auth_code
+- POST /claim-auth -> refresh_token
+- POST /renew (Bearer <refresh_token>) -> licença mensal
+- GET  /public-key, /healthz
 """
 import os, re, json, base64, hashlib, secrets
 from datetime import datetime, date, timedelta
@@ -25,8 +28,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator, model_validator, Field, ConfigDict
 
 from sqlalchemy import (
-    create_engine, select, func,
-    String, Integer, Boolean, DateTime, Text, JSON as SA_JSON
+    create_engine, select, func, text,
+    String, Integer, Boolean, DateTime, Text, JSON as SA_JSON, and_, delete
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Mapped, mapped_column
 
@@ -162,6 +165,15 @@ class LicenseLog(Base):
 
 Base.metadata.create_all(engine)
 
+# índices úteis (idempotentes)
+with engine.begin() as conn:
+    conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS idx_tokens_status_created ON tokens (status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_tokens_username_install ON tokens (username, installation_id);
+        CREATE INDEX IF NOT EXISTS idx_auth_codes_expires ON auth_codes (expires_at);
+        CREATE INDEX IF NOT EXISTS idx_licenses_created ON licenses (created_at);
+    """))
+
 
 # ===================== Chaves Ed25519 =====================
 def get_or_create_keys():
@@ -275,13 +287,22 @@ class IssueReq(BaseModel):
                 raise ValueError("fixed_min <= fixed_max")
         return self
 
+# NOVOS schemas admin
+class TokenDeleteReq(BaseModel):
+    tokens: list[str]
+
+class AdminCleanupReq(BaseModel):
+    purge_revoked_older_than_days: int = Field(default=90, ge=0)
+    purge_authcodes_older_than_days: int = Field(default=7, ge=0)
+    purge_licenses_older_than_days: int = Field(default=540, ge=0)  # 18 meses
+
 
 # ===================== FastAPI =====================
-app = FastAPI(title="Licensing Service v12 (DB)", version="1.0.0")
+app = FastAPI(title="Licensing Service v12.1 (DB)", version="1.1.0")
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "Licensing Service v12 (DB)", "version": "1.0.0", "docs": "/docs"}
+    return {"ok": True, "service": "Licensing Service v12.1 (DB)", "version": "1.1.0", "docs": "/docs"}
 
 @app.get("/public-key")
 def get_pk():
@@ -297,7 +318,6 @@ def healthz():
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 def _mask_url(url: str) -> str:
-    # mascara senha em ...://user:password@host/...
     return re.sub(r"(://[^:]+:)([^@]+)(@)", r"\1***\3", url)
 
 @app.get("/admin/debug/paths")
@@ -389,6 +409,14 @@ def claim_auth(req: ClaimAuthReq):
         if ac.expires_at < datetime.utcnow(): raise HTTPException(400, "auth_code expired")
         u = s.get(User, ac.username)
         if not u or u.status != "active": raise HTTPException(403, "user disabled")
+
+        # opcional: revogar token anterior dessa instalação
+        s.query(Token).filter(
+            and_(Token.username == u.username,
+                 Token.installation_id == req.installation_id,
+                 Token.status == "active")
+        ).update({Token.status: "revoked", Token.revoked_at: datetime.utcnow()})
+
         token = secrets.token_urlsafe(32)
         t = Token(
             token=token, username=u.username, cnpj=u.cnpj, company_name=u.company_name,
@@ -420,13 +448,10 @@ async def renew(request: Request):
             accepted_range=(rmin, rmax), require_sum_code=t.require_sum_code,
             letter_values=t.letter_values, features=t.features,
             issued_at=datetime.utcnow().isoformat() + "Z",
-            expires_at=eom(ym),
-            key_id=key_id(),
+            expires_at=eom(ym), key_id=key_id(),
         ).model_dump(by_alias=True)
 
         token_json = {"license": payload, "signature": sign(payload), "key_id": key_id()}
-
-        # log opcional
         s.add(LicenseLog(
             ym=ym, cnpj=t.cnpj, installation_id=t.installation_id,
             payload=token_json["license"], signature=token_json["signature"]
@@ -484,6 +509,39 @@ def issue(req: IssueReq, x_api_key: str = Header(default="")):
         ))
         s.commit()
     return token_json
+
+# -------- NOVO: excluir tokens (hard delete) --------
+@app.post("/admin/tokens/delete")
+def admin_tokens_delete(req: TokenDeleteReq, x_api_key: str = Header(default="")):
+    if x_api_key != ADMIN_API_KEY:
+        raise HTTPException(401, "unauthorized")
+    if not req.tokens:
+        raise HTTPException(400, "tokens list is empty")
+
+    with SessionLocal() as s:
+        s.execute(delete(Token).where(Token.token.in_(req.tokens)))
+        s.commit()
+    return {"ok": True, "deleted": len(req.tokens)}
+
+# -------- NOVO: limpeza (revogados antigos, auth_codes vencidos, logs antigos) --------
+@app.post("/admin/cleanup")
+def admin_cleanup(req: AdminCleanupReq, x_api_key: str = Header(default="")):
+    if x_api_key != ADMIN_API_KEY:
+        raise HTTPException(401, "unauthorized")
+    now = datetime.utcnow()
+    del_before_tokens = now - timedelta(days=req.purge_revoked_older_than_days)
+    del_before_codes  = now - timedelta(days=req.purge_authcodes_older_than_days)
+    del_before_logs   = now - timedelta(days=req.purge_licenses_older_than_days)
+
+    with SessionLocal() as s:
+        s.execute(delete(Token).where(
+            (Token.status == "revoked") & (Token.revoked_at < del_before_tokens)
+        ))
+        s.execute(delete(AuthCode).where(AuthCode.expires_at < del_before_codes))
+        s.execute(delete(LicenseLog).where(LicenseLog.created_at < del_before_logs))
+        s.commit()
+    return {"ok": True, "revoked_older_than_days": req.purge_revoked_older_than_days}
+# ---------------------------------------------------
 
 
 # Dev local
